@@ -1,6 +1,9 @@
+import "./App.css";
 import { useState, useEffect } from "react";
 import axios from "axios";
-import "./App.css";
+
+// If you don't have App.css yet, you can comment this out or create the file.
+// import "./App.css";
 
 const API = "http://127.0.0.1:8000";
 
@@ -23,7 +26,7 @@ function App() {
 
   const [suggested, setSuggested] = useState([]); // suggested settle-up transactions
 
-  // NEW: ad‑hoc n-people settle state
+  // Ad‑hoc n-people settle state
   const [nPeople, setNPeople] = useState(3);
   const [calcPeople, setCalcPeople] = useState([
     { user_id: 1, name: "Person 1", paid: 0, share: 0 },
@@ -92,11 +95,6 @@ function App() {
       alert("Network error while running calculator");
     }
   };
-
-  // Load group on first render (using DEMO123)
-  // useEffect(() => {
-  //   fetchGroup();
-  // }, []);
 
   const fetchGroup = async () => {
     try {
@@ -252,7 +250,13 @@ function App() {
 
   return (
     <div className="app">
-      <h1>💰 Pocket - Roommate Splitter</h1>
+      <div className="hero-title">
+        <div className="hero-main">
+          <span className="logo-icon">💰</span>
+          <span className="hero-text">Fair Shares</span>
+        </div>
+        <div className="hero-sub">Make Every Split Feel Fair</div>
+      </div>
 
       <div className="group-info">
         <input
@@ -268,6 +272,7 @@ function App() {
         <>
           {/* Debug box so you can SEE the group is loaded */}
           <div
+            className="debug-box"
             style={{
               background: "#222",
               color: "#0f0",
@@ -311,7 +316,9 @@ function App() {
 
             <div className="suggestions">
               <h3>Suggested Transfers (raw)</h3>
-              <pre>{JSON.stringify(suggested, null, 2)}</pre>
+              <pre className="suggestions-pre">
+                {JSON.stringify(suggested, null, 2)}
+              </pre>
             </div>
           </div>
 
@@ -412,7 +419,7 @@ function App() {
         </>
       )}
 
-      {/* NEW: Ad‑hoc n-people calculator (works even without loading a group) */}
+      {/* Ad‑hoc n-people calculator (works even without loading a group) */}
       <section
         style={{
           border: "1px solid #ccc",
