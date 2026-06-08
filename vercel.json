@@ -1,9 +1,5 @@
 {
   "version": 2,
-  "projects": [],
-  "builds": [],
-  "routes": [],
-  "functions": {},
   "framework": null,
   "outputDirectory": "frontend",
   "installCommand": "",
