@@ -924,8 +924,8 @@ function SessionPage() {
     const lines = [];
     const csvRows = [];
 
-    const sessionId = groupId; // session id from URL
-    const groupName = group?.name || ""; // group name
+    const sessionId = groupId; // from URL
+    const groupName = group?.name || "";
 
     // CSV header
     csvRows.push([
@@ -943,6 +943,7 @@ function SessionPage() {
         if (value && value !== 0) {
           const fromPerson = i + 1;
           const toPerson = j + 1;
+
           lines.push(`Person ${fromPerson} pays Person ${toPerson} ₹${value}`);
 
           csvRows.push([sessionId, groupName, fromPerson, toPerson, value]);
@@ -984,6 +985,224 @@ function SessionPage() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  };
+
+  // Upload CSV & minimize transactions (Optimal Account Balancing)
+  const handleUploadAndMinimizeCsv = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+
+      // Parse CSV (basic parser, assumes same format we generate)
+      const rows = text
+        .trim()
+        .split("\n")
+        .map((line) =>
+          line
+            .split(",")
+            .map((cell) =>
+              cell.startsWith('"') && cell.endsWith('"')
+                ? cell.slice(1, -1).replace(/""/g, '"')
+                : cell,
+            ),
+        );
+
+      if (rows.length < 2) {
+        alert("CSV has no data rows.");
+        return;
+      }
+
+      const header = rows[0];
+      const idxSessionId = header.indexOf("session_id");
+      const idxGroupName = header.indexOf("group_name");
+      const idxFrom = header.indexOf("from_person");
+      const idxTo = header.indexOf("to_person");
+      const idxAmount = header.indexOf("amount");
+
+      if (
+        idxSessionId === -1 ||
+        idxGroupName === -1 ||
+        idxFrom === -1 ||
+        idxTo === -1 ||
+        idxAmount === -1
+      ) {
+        alert("CSV format not recognized.");
+        return;
+      }
+
+      // Build net balance per person
+      const balances = new Map(); // person -> net (positive = should receive)
+      let sessionId = "";
+      let groupName = "";
+
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i];
+        if (row.length < header.length) continue;
+
+        sessionId = row[idxSessionId];
+        groupName = row[idxGroupName];
+
+        const from = Number(row[idxFrom]);
+        const to = Number(row[idxTo]);
+        const amount = Number(row[idxAmount]);
+
+        if (
+          !Number.isFinite(from) ||
+          !Number.isFinite(to) ||
+          !Number.isFinite(amount)
+        ) {
+          continue;
+        }
+
+        // from pays amount -> from net decreases, to net increases
+        balances.set(from, (balances.get(from) || 0) - amount);
+        balances.set(to, (balances.get(to) || 0) + amount);
+      }
+
+      // Extract non-zero balances into arrays
+      const persons = [];
+      const nets = [];
+      for (const [person, net] of balances.entries()) {
+        if (Math.abs(net) > 1e-6) {
+          persons.push(person);
+          nets.push(Math.round(net)); // optional rounding
+        }
+      }
+
+      if (persons.length === 0) {
+        alert("Nothing to minimize; all balances are already zero.");
+        return;
+      }
+
+      // Backtracking to minimize number of transactions (Optimal Account Balancing)
+      // nets[]: positive means should receive, negative means should pay
+      let minTxCount = Infinity;
+      let bestTransactions = [];
+
+      const dfs = (idx, currentNets, currentTx) => {
+        // Skip people whose balance is 0
+        while (idx < currentNets.length && currentNets[idx] === 0) idx++;
+
+        if (idx === currentNets.length) {
+          if (currentTx.length < minTxCount) {
+            minTxCount = currentTx.length;
+            bestTransactions = currentTx.map((t) => ({ ...t }));
+          }
+          return;
+        }
+
+        // If current count already >= best, prune
+        if (currentTx.length >= minTxCount) return;
+
+        // Try to settle currentNets[idx] with others
+        for (let j = idx + 1; j < currentNets.length; j++) {
+          if (currentNets[idx] * currentNets[j] >= 0) continue; // same sign or zero
+
+          const amount = Math.min(
+            Math.abs(currentNets[idx]),
+            Math.abs(currentNets[j]),
+          );
+
+          // i pays j or j pays i depending on signs
+          let fromPerson, toPerson;
+          if (currentNets[idx] < 0 && currentNets[j] > 0) {
+            fromPerson = persons[idx];
+            toPerson = persons[j];
+          } else {
+            fromPerson = persons[j];
+            toPerson = persons[idx];
+          }
+
+          const oldI = currentNets[idx];
+          const oldJ = currentNets[j];
+
+          // apply settlement
+          if (oldI < 0) {
+            currentNets[idx] += amount;
+          } else {
+            currentNets[idx] -= amount;
+          }
+          if (oldJ < 0) {
+            currentNets[j] += amount;
+          } else {
+            currentNets[j] -= amount;
+          }
+
+          currentTx.push({ from: fromPerson, to: toPerson, amount });
+
+          dfs(idx + 1, currentNets, currentTx);
+
+          // backtrack
+          currentTx.pop();
+          currentNets[idx] = oldI;
+          currentNets[j] = oldJ;
+
+          // small optimization: if after trying one j we found exact match, break
+          if (oldI + oldJ === 0) break;
+        }
+      };
+
+      dfs(0, [...nets], []);
+
+      if (bestTransactions.length === 0) {
+        alert("No non-zero balances; nothing to minimize.");
+        return;
+      }
+
+      // Build minimized CSV
+      const outRows = [];
+      outRows.push([
+        "session_id",
+        "group_name",
+        "from_person",
+        "to_person",
+        "amount",
+      ]);
+
+      for (const tx of bestTransactions) {
+        outRows.push([sessionId, groupName, tx.from, tx.to, tx.amount]);
+      }
+
+      const csvOut = outRows
+        .map((row) =>
+          row
+            .map((cell) => {
+              const s = String(cell ?? "");
+              if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+                return `"${s.replace(/"/g, '""')}"`;
+              }
+              return s;
+            })
+            .join(","),
+        )
+        .join("\n");
+
+      // Download minimized CSV
+      const blob = new Blob([csvOut], {
+        type: "text/csv;charset=utf-8;",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `settlement_session_${sessionId}_minimized.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      alert(
+        `Minimization complete. Original CSV had balances for ${persons.length} people. ` +
+          `Minimized to ${bestTransactions.length} transactions.`,
+      );
+    } catch (err) {
+      console.error("Error processing CSV for minimization", err);
+      alert("Error reading or minimizing CSV.");
+    } finally {
+      // Reset the file input so selecting the same file again works
+      event.target.value = "";
+    }
   };
 
   // ---- render ----
@@ -1098,12 +1317,14 @@ function SessionPage() {
         </div>
       )}
 
+      {/* Top buttons: add block, full & final, upload & minimize */}
       <div
         style={{
           marginBottom: "1rem",
           display: "flex",
           gap: "0.5rem",
           alignItems: "center",
+          flexWrap: "wrap",
         }}
       >
         <button
@@ -1117,6 +1338,25 @@ function SessionPage() {
         <button type="button" onClick={handleFullFinalSettlement}>
           Full &amp; Final Settlement
         </button>
+
+        {/* New: upload CSV to minimize */}
+        <label
+          style={{
+            border: "1px solid #ccc",
+            padding: "0.25rem 0.5rem",
+            borderRadius: 4,
+            cursor: "pointer",
+            fontSize: "0.85rem",
+          }}
+        >
+          Upload CSV &amp; Minimize
+          <input
+            type="file"
+            accept=".csv"
+            style={{ display: "none" }}
+            onChange={handleUploadAndMinimizeCsv}
+          />
+        </label>
       </div>
 
       {blocks.map((block) => (
