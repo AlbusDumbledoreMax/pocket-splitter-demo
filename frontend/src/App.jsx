@@ -1,12 +1,6 @@
 // frontend/src/App.jsx
 import "./App.css";
-import {
-  BrowserRouter,
-  Routes,
-  Route,
-  useNavigate,
-  useParams,
-} from "react-router-dom";
+import { Routes, Route, useNavigate, useParams } from "react-router-dom";
 import { useState, useEffect } from "react";
 import axios from "axios";
 import ExpenseCard from "./components/ExpenseCard";
@@ -468,7 +462,7 @@ function HomePage() {
         </>
       )}
 
-      {/* Ad‑hoc n-people calculator */}
+      {/* Ad‑hoc n-people calculator (local demo on Home) */}
       <section
         style={{
           border: "1px solid #ccc",
@@ -606,6 +600,9 @@ function SessionPage() {
   const [joining, setJoining] = useState(false);
   const [joinError, setJoinError] = useState("");
 
+  const [blocks, setBlocks] = useState([]);
+
+  // load group once
   useEffect(() => {
     const fetchGroup = async () => {
       setLoading(true);
@@ -620,10 +617,10 @@ function SessionPage() {
         setLoading(false);
       }
     };
-
     fetchGroup();
   }, [groupId]);
 
+  // restore participant from localStorage
   useEffect(() => {
     const key = `fairshares-participant-${groupId}`;
     const stored = window.localStorage.getItem(key);
@@ -679,48 +676,145 @@ function SessionPage() {
     }
   };
 
-  const handleAddExpense = async () => {
+  // ---- load shared ad‑hoc blocks with polling ----
+  useEffect(() => {
+    let cancelled = false;
+    const fetchBlocks = async () => {
+      try {
+        const { data } = await axios.get(
+          `${API}/groups/${groupId}/adhoc-blocks`,
+        );
+        if (!cancelled) setBlocks(data);
+      } catch (e) {
+        console.error("Error loading adhoc blocks", e);
+      }
+    };
+    fetchBlocks();
+    const id = setInterval(fetchBlocks, 2000); // poll every 2s
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [groupId]);
+
+  const addBlock = async () => {
     if (!participantId) {
       alert("Join the session first");
       return;
     }
     try {
-      const payload = { created_by_participant_id: participantId };
-      const res = await axios.post(
-        `${API}/groups/${group.id}/expenses`,
-        payload,
+      const { data } = await axios.post(
+        `${API}/groups/${groupId}/adhoc-blocks`,
       );
-      const newExp = {
-        id: res.data.id,
-        description: "",
-        amount: 0,
-        receipt_url: null,
-        splits: [],
-      };
-      setGroup((prev) => ({
-        ...prev,
-        expenses: [...(prev.expenses || []), newExp],
-      }));
+      // optimistic update
+      setBlocks((prev) => [...prev, data]);
     } catch (e) {
       console.error(e);
-      alert("Error creating blank expense");
+      alert("Error creating ad‑hoc block");
     }
   };
 
-  const handleFullAndFinal = () => {
-    alert("Full & Final Settlement (to be implemented)");
+  const updateBlockLocally = (blockId, updater) => {
+    setBlocks((prev) => prev.map((b) => (b.id === blockId ? updater(b) : b)));
   };
 
-  const handleExpenseUpdated = (expenseId, updatedExpense) => {
-    setGroup((prev) => {
-      if (!prev) return prev;
-      const nextExpenses = (prev.expenses || []).map((e) =>
-        e.id === expenseId ? { ...e, ...updatedExpense } : e,
+  const syncBlockToServer = async (block) => {
+    const payload = {
+      n_people: block.n_people,
+      people: block.people,
+      total_amount: Number(block.total_amount || 0),
+      equal_split: !!block.equal_split,
+      result: block.result || null,
+    };
+    try {
+      await axios.put(
+        `${API}/groups/${groupId}/adhoc-blocks/${block.id}`,
+        payload,
       );
-      return { ...prev, expenses: nextExpenses };
+    } catch (e) {
+      console.error("Error syncing block", block.id, e);
+    }
+  };
+
+  const handleNPeopleChange = (blockId, newN) => {
+    updateBlockLocally(blockId, (b) => {
+      const n_people = newN < 1 ? 1 : newN;
+      let people = [...b.people];
+      if (n_people > people.length) {
+        const start = people.length;
+        for (let i = start; i < n_people; i++) {
+          people.push({
+            user_id: i + 1,
+            name: `Person ${i + 1}`,
+            paid: 0,
+            share: 0,
+          });
+        }
+      } else if (n_people < people.length) {
+        people.length = n_people;
+      }
+      const updated = { ...b, n_people, people };
+      syncBlockToServer(updated);
+      return updated;
     });
   };
 
+  const updatePersonField = (blockId, index, field, value) => {
+    updateBlockLocally(blockId, (b) => {
+      const people = [...b.people];
+      people[index] = { ...people[index], [field]: value };
+      const updated = { ...b, people };
+      syncBlockToServer(updated);
+      return updated;
+    });
+  };
+
+  const updateBlockField = (blockId, field, value) => {
+    updateBlockLocally(blockId, (b) => {
+      const updated = { ...b, [field]: value };
+      syncBlockToServer(updated);
+      return updated;
+    });
+  };
+
+  const runCustomSettle = async (blockId) => {
+    const block = blocks.find((b) => b.id === blockId);
+    if (!block) return;
+
+    const payload = {
+      total_amount: Number(block.total_amount || 0),
+      equal_split: !!block.equal_split,
+      people: block.people.map((p) => ({
+        user_id: p.user_id,
+        name: p.name,
+        paid: Number(p.paid || 0),
+        share: Number(p.share || 0),
+      })),
+    };
+
+    try {
+      const res = await fetch("http://127.0.0.1:8000/calc/settle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        alert("Error running settle calculator");
+        return;
+      }
+      const data = await res.json();
+      updateBlockLocally(blockId, (b) => {
+        const updated = { ...b, result: data };
+        syncBlockToServer(updated);
+        return updated;
+      });
+    } catch (err) {
+      console.error("Error calling /calc/settle", err);
+      alert("Network error while running calculator");
+    }
+  };
+
+  // ---- render ----
   if (loading) {
     return <div className="app">Loading session...</div>;
   }
@@ -730,7 +824,6 @@ function SessionPage() {
   }
 
   const shareLink = window.location.href;
-  const participants = group.members || [];
 
   return (
     <div className="app">
@@ -842,7 +935,7 @@ function SessionPage() {
         }}
       >
         <button
-          onClick={handleAddExpense}
+          onClick={addBlock}
           disabled={!participantId}
           title={!participantId ? "Join the session first" : ""}
         >
@@ -850,27 +943,139 @@ function SessionPage() {
         </button>
       </div>
 
-      <div>
-        {(group.expenses || []).map((exp) => (
-          <ExpenseCard
-            key={exp.id}
-            expense={exp}
-            participants={participants}
-            onUpdated={handleExpenseUpdated}
-          />
-        ))}
-      </div>
+      {blocks.map((block) => (
+        <section
+          key={block.id}
+          style={{
+            border: "1px solid #ccc",
+            padding: 16,
+            marginTop: 24,
+            background: "#fafafa",
+          }}
+        >
+          <h3>Ad‑hoc Group Settle (n people)</h3>
 
-      <div style={{ marginTop: "1.5rem" }}>
-        <button onClick={handleFullAndFinal}>
-          Full &amp; Final Settlement
-        </button>
-      </div>
+          <div style={{ marginBottom: 8 }}>
+            <label>
+              Number of people (n):{" "}
+              <input
+                type="number"
+                min={1}
+                value={block.n_people}
+                onChange={(e) =>
+                  handleNPeopleChange(block.id, Number(e.target.value) || 1)
+                }
+              />
+            </label>
+          </div>
+
+          <div style={{ marginBottom: 8 }}>
+            <label>
+              Total amount:{" "}
+              <input
+                type="number"
+                value={block.total_amount}
+                onChange={(e) =>
+                  updateBlockField(block.id, "total_amount", e.target.value)
+                }
+              />
+            </label>
+          </div>
+
+          <div style={{ marginBottom: 8 }}>
+            <label>
+              <input
+                type="checkbox"
+                checked={block.equal_split}
+                onChange={(e) =>
+                  updateBlockField(block.id, "equal_split", e.target.checked)
+                }
+              />{" "}
+              Equal split (ignore % shares)
+            </label>
+          </div>
+
+          <table
+            border="1"
+            cellPadding="4"
+            style={{ marginBottom: 8, width: "100%" }}
+          >
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Who (name)</th>
+                <th>Paid amount</th>
+                <th>Share % / weight</th>
+              </tr>
+            </thead>
+            <tbody>
+              {block.people.map((p, idx) => (
+                <tr key={p.user_id}>
+                  <td>{idx + 1}</td>
+                  <td>
+                    <input
+                      value={p.name}
+                      onChange={(e) =>
+                        updatePersonField(block.id, idx, "name", e.target.value)
+                      }
+                    />
+                  </td>
+                  <td>
+                    <input
+                      type="number"
+                      value={p.paid}
+                      onChange={(e) =>
+                        updatePersonField(block.id, idx, "paid", e.target.value)
+                      }
+                    />
+                  </td>
+                  <td>
+                    <input
+                      type="number"
+                      value={p.share}
+                      onChange={(e) =>
+                        updatePersonField(
+                          block.id,
+                          idx,
+                          "share",
+                          e.target.value,
+                        )
+                      }
+                    />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          <button onClick={() => runCustomSettle(block.id)}>
+            Show Settlement Suggestions
+          </button>
+
+          {block.result && (
+            <div style={{ marginTop: 12 }}>
+              <h4>Suggested settlements</h4>
+              <ul>
+                {block.result.transactions.map((tx, i) => {
+                  const from = block.people.find(
+                    (p) => p.user_id === tx.from_user,
+                  );
+                  const to = block.people.find((p) => p.user_id === tx.to_user);
+                  return (
+                    <li key={i}>
+                      {from?.name || tx.from_user} pays {to?.name || tx.to_user}{" "}
+                      ₹{tx.amount.toFixed(2)}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
+        </section>
+      ))}
     </div>
   );
 }
-
-// ---------------- App: router ----------------
 
 // ---------------- App: router ----------------
 
