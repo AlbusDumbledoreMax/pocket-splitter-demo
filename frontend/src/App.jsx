@@ -1,18 +1,23 @@
+// frontend/src/App.jsx
 import "./App.css";
+import {
+  BrowserRouter,
+  Routes,
+  Route,
+  useNavigate,
+  useParams,
+} from "react-router-dom";
 import { useState, useEffect } from "react";
 import axios from "axios";
-
-// If you don't have App.css yet, you can comment this out or create the file.
-// import "./App.css";
+import ExpenseCard from "./components/ExpenseCard";
 
 const API = "http://127.0.0.1:8000";
 
-function App() {
-  // invite code string (DEMO123 by default)
+// ---------------- HomePage: existing logic + new "Create group" ----------------
+
+function HomePage() {
   const [groupCode, setGroupCode] = useState("DEMO123");
-  // full group object from backend
   const [group, setGroup] = useState(null);
-  // numeric group id (from backend)
   const [groupId, setGroupId] = useState(null);
 
   const [balances, setBalances] = useState([]);
@@ -24,7 +29,7 @@ function App() {
     splits: [{ user: "", share: "" }],
   });
 
-  const [suggested, setSuggested] = useState([]); // suggested settle-up transactions
+  const [suggested, setSuggested] = useState([]);
 
   // Ad‑hoc n-people settle state
   const [nPeople, setNPeople] = useState(3);
@@ -36,6 +41,12 @@ function App() {
   const [calcTotal, setCalcTotal] = useState(0);
   const [calcEqualSplit, setCalcEqualSplit] = useState(false);
   const [calcResult, setCalcResult] = useState(null);
+
+  // NEW: state for "Create group"
+  const [newGroupName, setNewGroupName] = useState("");
+  const [creatingGroup, setCreatingGroup] = useState(false);
+  const [createError, setCreateError] = useState("");
+  const navigate = useNavigate();
 
   // Keep calcPeople array length in sync with nPeople
   useEffect(() => {
@@ -98,13 +109,11 @@ function App() {
 
   const fetchGroup = async () => {
     try {
-      console.log("Fetching group for code:", groupCode);
       const { data } = await axios.get(`${API}/group/${groupCode}`);
-      console.log("Group loaded:", data);
       setGroup(data);
-      setGroupId(data.id); // store numeric id for later
+      setGroupId(data.id);
       await fetchBalances(data.id);
-      setSuggested([]); // clear old suggestions when group changes
+      setSuggested([]);
     } catch (e) {
       console.error("Error fetching group:", e);
       alert("Group not found");
@@ -116,9 +125,7 @@ function App() {
   };
 
   const fetchBalances = async (gid) => {
-    console.log("Fetching balances for group:", gid);
     const { data } = await axios.get(`${API}/group/${gid}/balances`);
-    console.log("Balances:", data);
     setBalances(data);
   };
 
@@ -127,11 +134,9 @@ function App() {
       alert("Load a group first");
       return;
     }
-    console.log("Clicked Show Settle Up Suggestions");
     const { data } = await axios.get(
       `${API}/group/${groupId}/settlements/suggested`,
     );
-    console.log("Suggested settlements:", data.transactions);
     setSuggested(data.transactions);
   };
 
@@ -146,7 +151,6 @@ function App() {
       .filter((s) => s.user && s.share !== "")
       .map((s) => ({
         user_id: parseInt(s.user, 10),
-        // UI takes percentage (40,30,30); backend expects fraction (0.4,0.3,0.3)
         share: parseFloat(s.share) / 100,
       }));
 
@@ -168,11 +172,8 @@ function App() {
       splits: splitsPayload,
     };
 
-    console.log("Submitting expense payload:", payload);
-
     try {
       await axios.post(`${API}/group/${groupId}/expense`, payload);
-      console.log("Expense created successfully");
       setNewExpense({
         paidBy: "",
         amount: "",
@@ -180,7 +181,7 @@ function App() {
         splits: [{ user: "", share: "" }],
       });
       await fetchBalances(groupId);
-      setSuggested([]); // clear suggestions; they may have changed
+      setSuggested([]);
     } catch (e) {
       console.error("Error creating expense:", e.response || e);
       alert("Error: " + (e.response?.data?.detail || "Invalid splits"));
@@ -192,7 +193,6 @@ function App() {
       alert("Load group first");
       return;
     }
-    console.log("Clicked Confirm Settle Up");
 
     if (
       suggested.length === 0 &&
@@ -205,7 +205,6 @@ function App() {
 
     if (window.confirm("Settle up? This records transactions.")) {
       await axios.post(`${API}/group/${groupId}/settle`);
-      console.log("Settle up applied");
       await fetchBalances(groupId);
       setSuggested([]);
     }
@@ -248,6 +247,42 @@ function App() {
     },
   ];
 
+  const handleCreateGroup = async () => {
+    if (!newGroupName.trim()) {
+      setCreateError("Please enter a group name");
+      return;
+    }
+    setCreateError("");
+    setCreatingGroup(true);
+    try {
+      const res = await fetch(`${API}/groups`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: newGroupName.trim() }),
+      });
+      if (!res.ok) {
+        throw new Error("Failed to create group");
+      }
+      const data = await res.json();
+      navigate(`/session/${data.group_id}`);
+    } catch (e) {
+      console.error(e);
+      setCreateError(e.message || "Something went wrong");
+    } finally {
+      setCreatingGroup(false);
+    }
+  };
+
+  const handleExpenseUpdated = (expenseId, updatedExpense) => {
+    setGroup((prev) => {
+      if (!prev) return prev;
+      const nextExpenses = (prev.expenses || []).map((e) =>
+        e.id === expenseId ? { ...e, ...updatedExpense } : e,
+      );
+      return { ...prev, expenses: nextExpenses };
+    });
+  };
+
   return (
     <div className="app">
       <div className="hero-title">
@@ -268,9 +303,23 @@ function App() {
         <button onClick={fetchGroup}>Load Group</button>
       </div>
 
+      <div className="group-info" style={{ marginTop: "0.75rem" }}>
+        <input
+          value={newGroupName}
+          onChange={(e) => setNewGroupName(e.target.value)}
+          placeholder="New group name (e.g. Goa Trip)"
+          className="code-input"
+        />
+        <button onClick={handleCreateGroup} disabled={creatingGroup}>
+          {creatingGroup ? "Creating..." : "Create group"}
+        </button>
+      </div>
+      {createError && (
+        <div style={{ color: "red", marginTop: "0.25rem" }}>{createError}</div>
+      )}
+
       {group && (
         <>
-          {/* Debug box so you can SEE the group is loaded */}
           <div
             className="debug-box"
             style={{
@@ -419,7 +468,7 @@ function App() {
         </>
       )}
 
-      {/* Ad‑hoc n-people calculator (works even without loading a group) */}
+      {/* Ad‑hoc n-people calculator */}
       <section
         style={{
           border: "1px solid #ccc",
@@ -539,6 +588,298 @@ function App() {
         )}
       </section>
     </div>
+  );
+}
+
+// ---------------- SessionPage: /session/:groupId ----------------
+
+function SessionPage() {
+  const { groupId } = useParams();
+  const [group, setGroup] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const [participantId, setParticipantId] = useState(null);
+  const [showJoinDialog, setShowJoinDialog] = useState(false);
+  const [joinName, setJoinName] = useState("");
+  const [joinEmail, setJoinEmail] = useState("");
+  const [joining, setJoining] = useState(false);
+  const [joinError, setJoinError] = useState("");
+
+  useEffect(() => {
+    const fetchGroup = async () => {
+      setLoading(true);
+      setError("");
+      try {
+        const { data } = await axios.get(`${API}/groups/${groupId}`);
+        setGroup(data);
+      } catch (e) {
+        console.error(e);
+        setError("Could not load group");
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchGroup();
+  }, [groupId]);
+
+  useEffect(() => {
+    const key = `fairshares-participant-${groupId}`;
+    const stored = window.localStorage.getItem(key);
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored);
+        if (parsed && parsed.id) {
+          setParticipantId(parsed.id);
+          setJoinName(parsed.name || "");
+          setJoinEmail(parsed.email || "");
+          return;
+        }
+      } catch (e) {
+        console.warn("Could not parse stored participant", e);
+      }
+    }
+    setShowJoinDialog(true);
+  }, [groupId]);
+
+  const handleJoinSession = async (e) => {
+    e.preventDefault();
+    if (!joinName.trim()) {
+      setJoinError("Please enter your name");
+      return;
+    }
+    setJoinError("");
+    setJoining(true);
+    try {
+      const payload = {
+        name: joinName.trim(),
+        email: joinEmail.trim() || null,
+      };
+      const { data } = await axios.post(
+        `${API}/groups/${groupId}/participants`,
+        payload,
+      );
+      setParticipantId(data.id);
+      const key = `fairshares-participant-${groupId}`;
+      window.localStorage.setItem(
+        key,
+        JSON.stringify({
+          id: data.id,
+          name: data.name,
+          email: data.email,
+        }),
+      );
+      setShowJoinDialog(false);
+    } catch (e) {
+      console.error(e);
+      setJoinError("Could not join this session");
+    } finally {
+      setJoining(false);
+    }
+  };
+
+  const handleAddExpense = async () => {
+    if (!participantId) {
+      alert("Join the session first");
+      return;
+    }
+    try {
+      const payload = { created_by_participant_id: participantId };
+      const res = await axios.post(
+        `${API}/groups/${group.id}/expenses`,
+        payload,
+      );
+      const newExp = {
+        id: res.data.id,
+        description: "",
+        amount: 0,
+        receipt_url: null,
+        splits: [],
+      };
+      setGroup((prev) => ({
+        ...prev,
+        expenses: [...(prev.expenses || []), newExp],
+      }));
+    } catch (e) {
+      console.error(e);
+      alert("Error creating blank expense");
+    }
+  };
+
+  const handleFullAndFinal = () => {
+    alert("Full & Final Settlement (to be implemented)");
+  };
+
+  const handleExpenseUpdated = (expenseId, updatedExpense) => {
+    setGroup((prev) => {
+      if (!prev) return prev;
+      const nextExpenses = (prev.expenses || []).map((e) =>
+        e.id === expenseId ? { ...e, ...updatedExpense } : e,
+      );
+      return { ...prev, expenses: nextExpenses };
+    });
+  };
+
+  if (loading) {
+    return <div className="app">Loading session...</div>;
+  }
+
+  if (error || !group) {
+    return <div className="app">Error: {error || "Group not found"}</div>;
+  }
+
+  const shareLink = window.location.href;
+  const participants = group.members || [];
+
+  return (
+    <div className="app">
+      <div className="hero-title">
+        <div className="hero-main">
+          <span className="logo-icon">💰</span>
+          <span className="hero-text">Fair Shares</span>
+        </div>
+        <div className="hero-sub">Session for {group.name}</div>
+      </div>
+
+      {showJoinDialog && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1000,
+          }}
+        >
+          <form
+            onSubmit={handleJoinSession}
+            style={{
+              background: "white",
+              padding: "1.5rem",
+              borderRadius: 8,
+              minWidth: 320,
+              boxShadow: "0 4px 12px rgba(0,0,0,0.2)",
+            }}
+          >
+            <h3>Join this session</h3>
+            <p>
+              Enter your name (and email if you like) so others know who you
+              are.
+            </p>
+
+            <div style={{ marginBottom: "0.75rem" }}>
+              <input
+                type="text"
+                placeholder="Your name"
+                value={joinName}
+                onChange={(e) => setJoinName(e.target.value)}
+                style={{
+                  width: "100%",
+                  padding: "0.5rem",
+                  borderRadius: 4,
+                  border: "1px solid #ccc",
+                }}
+              />
+            </div>
+
+            <div style={{ marginBottom: "0.75rem" }}>
+              <input
+                type="email"
+                placeholder="Your email (optional)"
+                value={joinEmail}
+                onChange={(e) => setJoinEmail(e.target.value)}
+                style={{
+                  width: "100%",
+                  padding: "0.5rem",
+                  borderRadius: 4,
+                  border: "1px solid #ccc",
+                }}
+              />
+            </div>
+
+            {joinError && (
+              <div style={{ color: "red", marginBottom: "0.5rem" }}>
+                {joinError}
+              </div>
+            )}
+
+            <button type="submit" disabled={joining}>
+              {joining ? "Joining..." : "Join session"}
+            </button>
+          </form>
+        </div>
+      )}
+
+      <div style={{ marginBottom: "1rem" }}>
+        <p>Share this link with friends:</p>
+        <input
+          value={shareLink}
+          readOnly
+          style={{
+            width: "100%",
+            padding: "0.5rem",
+            borderRadius: 4,
+            border: "1px solid #ccc",
+          }}
+        />
+      </div>
+
+      {participantId && (
+        <div style={{ marginBottom: "0.75rem", fontSize: "0.9rem" }}>
+          You are joined as <strong>{joinName || "Guest"}</strong>.
+        </div>
+      )}
+
+      <div
+        style={{
+          marginBottom: "1rem",
+          display: "flex",
+          gap: "0.5rem",
+          alignItems: "center",
+        }}
+      >
+        <button
+          onClick={handleAddExpense}
+          disabled={!participantId}
+          title={!participantId ? "Join the session first" : ""}
+        >
+          + Add more expense
+        </button>
+      </div>
+
+      <div>
+        {(group.expenses || []).map((exp) => (
+          <ExpenseCard
+            key={exp.id}
+            expense={exp}
+            participants={participants}
+            onUpdated={handleExpenseUpdated}
+          />
+        ))}
+      </div>
+
+      <div style={{ marginTop: "1.5rem" }}>
+        <button onClick={handleFullAndFinal}>
+          Full &amp; Final Settlement
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- App: router ----------------
+
+// ---------------- App: router ----------------
+
+function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<HomePage />} />
+      <Route path="/session/:groupId" element={<SessionPage />} />
+    </Routes>
   );
 }
 

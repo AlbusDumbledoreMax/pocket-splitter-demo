@@ -13,20 +13,30 @@ import csv
 from pathlib import Path
 import json
 
+# -------------------------------------------------
+# FastAPI app & CORS
+# -------------------------------------------------
+
 app = FastAPI()
 
 origins = [
     "http://127.0.0.1:5500",
     "http://localhost:5500",
+    "http://localhost:5173",      # Vite dev
+    "http://127.0.0.1:5173",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # TEMP: allow everything
+    allow_origins=["*"],          # dev: allow all
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -------------------------------------------------
+# Database setup
+# -------------------------------------------------
 
 engine = create_engine("sqlite:///./pocket.db")
 SessionLocal = sessionmaker(bind=engine)
@@ -35,8 +45,10 @@ Base = declarative_base()
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# -------------------------------------------------
+# SQLAlchemy models
+# -------------------------------------------------
 
-# Models
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
@@ -47,7 +59,7 @@ class User(Base):
 
 class Group(Base):
     __tablename__ = "groups"
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, index=True)
     name = Column(String)
     invite_code = Column(String, unique=True)
     members = relationship("GroupMember", back_populates="group")
@@ -63,16 +75,33 @@ class GroupMember(Base):
     user = relationship("User", back_populates="groups")
 
 
-class Expense(Base):
-    __tablename__ = "expenses"
+# NEW: Participant model used for session joining
+class Participant(Base):
+    __tablename__ = "participants"
     id = Column(Integer, primary_key=True)
     group_id = Column(Integer, ForeignKey("groups.id"))
-    paid_by = Column(Integer, ForeignKey("users.id"))
-    amount = Column(Float)
-    description = Column(String)
-    receipt_url = Column(String, nullable=True)  # image path
-    splits = relationship("Split", back_populates="expense")
+    name = Column(String)
+    email = Column(String)
     group = relationship("Group")
+
+
+class Expense(Base):
+    __tablename__ = "expenses"
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey("groups.id"))
+    paid_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    amount = Column(Float, nullable=True)
+    description = Column(String, nullable=True)
+
+    # Collaborative fields
+    name = Column(String, nullable=True)  # short title shown in ExpenseCard
+    created_by_participant_id = Column(
+        Integer, ForeignKey("participants.id"), nullable=True
+    )
+    receipt_url = Column(String, nullable=True)  # image path / proof
+
+    splits = relationship("Split", back_populates="expense")
+    group = relationship("Group", back_populates="expenses")
 
 
 class Split(Base):
@@ -81,7 +110,7 @@ class Split(Base):
     expense_id = Column(Integer, ForeignKey("expenses.id"))
     user_id = Column(Integer, ForeignKey("users.id"))
     share = Column(Float)
-    expense = relationship("Expense")
+    expense = relationship("Expense", back_populates="splits")
 
 
 class Transaction(Base):
@@ -96,10 +125,18 @@ class Transaction(Base):
 
 Base.metadata.create_all(engine)
 
+# -------------------------------------------------
+# Pydantic models (request/response)
+# -------------------------------------------------
 
-# Pydantic models
 class GroupCreate(BaseModel):
     name: str
+
+
+class GroupCreateResponse(BaseModel):
+    group_id: int
+    name: str
+    invite_url: str
 
 
 class ExpenseCreate(BaseModel):
@@ -107,6 +144,19 @@ class ExpenseCreate(BaseModel):
     amount: float
     description: str
     splits: List[dict]  # [{"user_id": 1, "share": 0.4}, ...]
+
+
+# Collaborative expense payloads
+class ExpenseBlankCreate(BaseModel):
+    created_by_participant_id: int | None = None
+
+
+class ExpenseUpdate(BaseModel):
+    name: str | None = None
+    paid_by: int | None = None
+    total_amount: float | None = None
+    proof_image_url: str | None = None
+    splits: List[dict] | None = None  # [{"user_id": 1, "share": 0.4}, ...]
 
 
 class Balances(BaseModel):
@@ -119,6 +169,19 @@ class JoinGroupRequest(BaseModel):
     invite_code: str
     email: str
     name: str
+
+
+# Participant schemas
+class ParticipantCreate(BaseModel):
+    name: str
+    email: str | None = None
+
+
+class ParticipantResponse(BaseModel):
+    id: int
+    group_id: int
+    name: str
+    email: str | None = None
 
 
 # Calculator models
@@ -140,8 +203,10 @@ class CalcResult(BaseModel):
     net: Dict[int, float]
     transactions: List[Dict[str, float]]
 
+# -------------------------------------------------
+# DB dependency
+# -------------------------------------------------
 
-# Deps
 def get_db():
     db = SessionLocal()
     try:
@@ -149,8 +214,10 @@ def get_db():
     finally:
         db.close()
 
+# -------------------------------------------------
+# Seed demo data
+# -------------------------------------------------
 
-# Seed demo data (idempotent, no UNIQUE issues)
 def seed_demo():
     db = SessionLocal()
     try:
@@ -192,24 +259,45 @@ def seed_demo():
         db.close()
 
 
-# Seed demo when module is imported (so it works with uvicorn main:app)
 seed_demo()
 
-
+# -------------------------------------------------
 # Routes
+# -------------------------------------------------
+
 @app.get("/")
 def root():
     return {"message": "Pocket Splitter API", "demo_group": "/group/DEMO123"}
 
 
+# OLD: create group with invite_code
 @app.post("/group")
-def create_group(group: GroupCreate, db: Session = Depends(get_db)):
+def create_group_old(group: GroupCreate, db: Session = Depends(get_db)):
     invite_code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
     new_group = Group(name=group.name, invite_code=invite_code)
     db.add(new_group)
     db.commit()
     db.refresh(new_group)
     return new_group
+
+
+# NEW: create group for React flow (POST /groups)
+@app.post("/groups", response_model=GroupCreateResponse)
+def create_group_new(group: GroupCreate, db: Session = Depends(get_db)):
+    invite_code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    new_group = Group(name=group.name, invite_code=invite_code)
+    db.add(new_group)
+    db.commit()
+    db.refresh(new_group)
+
+    # Local dev: use http://localhost:5173/session/{id}
+    invite_url = f"https://fairshares-blush.vercel.app/session/{new_group.id}"
+
+    return GroupCreateResponse(
+        group_id=new_group.id,
+        name=new_group.name,
+        invite_url=invite_url,
+    )
 
 
 @app.get("/group/{invite_code}")
@@ -223,6 +311,69 @@ def get_group(invite_code: str, db: Session = Depends(get_db)):
         "invite_code": group.invite_code,
         "members": [{"id": m.user.id, "name": m.user.name} for m in group.members],
     }
+
+
+# NEW: Get group by numeric id for /session/:groupId
+@app.get("/groups/{group_id}")
+def get_group_by_id(group_id: int, db: Session = Depends(get_db)):
+    group = db.query(Group).filter(Group.id == group_id).first()
+    if not group:
+        raise HTTPException(404, "Group not found")
+
+    members = [{"id": m.user.id, "name": m.user.name} for m in group.members]
+
+    expenses = []
+    for e in group.expenses:
+        splits = [
+            {"user_id": s.user_id, "share": s.share}
+            for s in e.splits
+        ]
+        expenses.append(
+            {
+                "id": e.id,
+                "description": e.description,
+                "amount": e.amount,
+                "paid_by": e.paid_by,
+                "receipt_url": e.receipt_url,
+                "splits": splits,
+            }
+        )
+
+    return {
+        "id": group.id,
+        "name": group.name,
+        "invite_code": group.invite_code,
+        "members": members,
+        "expenses": expenses,
+    }
+
+
+# NEW: join by numeric group id (participants)
+@app.post("/groups/{group_id}/participants", response_model=ParticipantResponse)
+def join_group_by_id(
+    group_id: int,
+    participant: ParticipantCreate,
+    db: Session = Depends(get_db),
+):
+    group = db.query(Group).filter(Group.id == group_id).first()
+    if not group:
+        raise HTTPException(404, "Group not found")
+
+    new_participant = Participant(
+        group_id=group_id,
+        name=participant.name.strip(),
+        email=(participant.email or "").strip() or None,
+    )
+    db.add(new_participant)
+    db.commit()
+    db.refresh(new_participant)
+
+    return ParticipantResponse(
+        id=new_participant.id,
+        group_id=new_participant.group_id,
+        name=new_participant.name,
+        email=new_participant.email,
+    )
 
 
 @app.post("/group/join")
@@ -255,6 +406,7 @@ def join_group(req: JoinGroupRequest, db: Session = Depends(get_db)):
     }
 
 
+# EXISTING: create full expense in one go (legacy flow)
 @app.post("/group/{group_id}/expense")
 def add_expense(group_id: int, expense: ExpenseCreate, db: Session = Depends(get_db)):
     total_split = sum(s["share"] for s in expense.splits)
@@ -266,6 +418,7 @@ def add_expense(group_id: int, expense: ExpenseCreate, db: Session = Depends(get
         paid_by=expense.paid_by,
         amount=expense.amount,
         description=expense.description,
+        name=expense.description,
     )
     db.add(new_expense)
     db.flush()
@@ -282,7 +435,89 @@ def add_expense(group_id: int, expense: ExpenseCreate, db: Session = Depends(get
     return {"id": new_expense.id}
 
 
-# Expense with image upload
+# NEW: collaborative – create blank expense
+@app.post("/groups/{group_id}/expenses")
+def create_blank_expense(
+    group_id: int,
+    payload: ExpenseBlankCreate,
+    db: Session = Depends(get_db),
+):
+    group = db.query(Group).filter(Group.id == group_id).first()
+    if not group:
+        raise HTTPException(404, "Group not found")
+
+    new_expense = Expense(
+        group_id=group_id,
+        paid_by=None,
+        amount=0.0,
+        description="",
+        name="",
+        created_by_participant_id=payload.created_by_participant_id,
+        receipt_url=None,
+    )
+    db.add(new_expense)
+    db.commit()
+    db.refresh(new_expense)
+    return {"id": new_expense.id}
+
+
+# NEW: collaborative – update expense
+@app.put("/expenses/{expense_id}")
+def update_expense(
+    expense_id: int,
+    payload: ExpenseUpdate,
+    db: Session = Depends(get_db),
+):
+    expense = db.query(Expense).filter(Expense.id == expense_id).first()
+    if not expense:
+        raise HTTPException(404, "Expense not found")
+
+    # Update scalar fields if present
+    if payload.name is not None:
+        expense.name = payload.name
+        expense.description = payload.name  # keep both in sync
+
+    if payload.paid_by is not None:
+        expense.paid_by = payload.paid_by
+
+    if payload.total_amount is not None:
+        expense.amount = payload.total_amount
+
+    if payload.proof_image_url is not None:
+        expense.receipt_url = payload.proof_image_url
+
+    # Replace splits if provided
+    if payload.splits is not None:
+        db.query(Split).filter(Split.expense_id == expense.id).delete()
+        for s in payload.splits:
+            # Accept either "user_id" or "id" (depending on how frontend builds splits)
+            uid = s.get("user_id") or s.get("id")
+            if uid is None:
+                continue
+            share = s.get("share", 0.0)
+            db.add(
+                Split(
+                    expense_id=expense.id,
+                    user_id=uid,
+                    share=share,
+                )
+            )
+
+    db.commit()
+    db.refresh(expense)
+
+    return {
+        "id": expense.id,
+        "group_id": expense.group_id,
+        "name": expense.name,
+        "paid_by": expense.paid_by,
+        "amount": expense.amount,
+        "created_by_participant_id": expense.created_by_participant_id,
+        "receipt_url": expense.receipt_url,
+    }
+
+
+# Expense with image upload (legacy: create expense + receipt in one go)
 @app.post("/group/{group_id}/expense-with-receipt")
 async def add_expense_with_receipt(
     group_id: int,
@@ -296,7 +531,7 @@ async def add_expense_with_receipt(
     splits_data = json.loads(splits)
 
     filename = f"{datetime.utcnow().timestamp()}_{file.filename}"
-    filepath = UPLOAD_DIR / filename
+    filepath = UPLOAD_DIR | Path(filename)
     with open(filepath, "wb") as f:
         f.write(await file.read())
 
@@ -305,6 +540,7 @@ async def add_expense_with_receipt(
         paid_by=paid_by,
         amount=amount,
         description=description,
+        name=description,
         receipt_url=str(filepath),
     )
     db.add(new_expense)
@@ -322,6 +558,45 @@ async def add_expense_with_receipt(
     return {"id": new_expense.id, "receipt_url": new_expense.receipt_url}
 
 
+# NEW: per-expense proof image upload
+@app.post("/expenses/{expense_id}/proof")
+async def upload_expense_proof(
+    expense_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    # Find the expense
+    expense = db.query(Expense).filter(Expense.id == expense_id).first()
+    if not expense:
+        raise HTTPException(404, "Expense not found")
+
+    # Save file to uploads/ directory
+    timestamp = int(datetime.utcnow().timestamp())
+    safe_name = (file.filename or "proof").replace(" ", "_")
+    filename = f"{timestamp}_{safe_name}"
+    filepath = UPLOAD_DIR / filename
+
+    with open(filepath, "wb") as f:
+        f.write(await file.read())
+
+    # Store path/URL on the expense (acts as proof_image_url)
+    expense.receipt_url = str(filepath)
+    db.add(expense)
+    db.commit()
+    db.refresh(expense)
+
+    # Return updated expense so frontend can update state
+    return {
+        "id": expense.id,
+        "group_id": expense.group_id,
+        "name": expense.name,
+        "paid_by": expense.paid_by,
+        "amount": expense.amount,
+        "created_by_participant_id": expense.created_by_participant_id,
+        "receipt_url": expense.receipt_url,
+    }
+
+
 @app.get("/group/{group_id}/balances")
 def get_balances(group_id: int, db: Session = Depends(get_db)):
     group = db.query(Group).filter(Group.id == group_id).first()
@@ -337,7 +612,8 @@ def get_balances(group_id: int, db: Session = Depends(get_db)):
             owed = expense.amount * split.share
             balances[split.user_id] -= owed
         # payer paid full amount
-        balances[expense.paid_by] += expense.amount
+        if expense.paid_by is not None:
+            balances[expense.paid_by] += expense.amount
 
     return [
         {"user_id": uid, "name": name, "balance": balances.get(uid, 0.0)}
@@ -358,7 +634,8 @@ def suggested_settlements(group_id: int, db: Session = Depends(get_db)):
         for split in expense.splits:
             owed = expense.amount * split.share
             balances[split.user_id] -= owed
-        balances[expense.paid_by] += expense.amount
+        if expense.paid_by is not None:
+            balances[expense.paid_by] += expense.amount
 
     transactions = net_transactions(balances)
 
@@ -390,7 +667,8 @@ def settle_up(group_id: int, db: Session = Depends(get_db)):
         for split in expense.splits:
             owed = expense.amount * split.share
             balances[split.user_id] -= owed
-        balances[expense.paid_by] += expense.amount
+        if expense.paid_by is not None:
+            balances[expense.paid_by] += expense.amount
 
     # 2) Compute suggested transactions to settle these balances
     transactions = net_transactions(balances)
@@ -401,7 +679,6 @@ def settle_up(group_id: int, db: Session = Depends(get_db)):
         to_user = tx["to_user"]
         amount = tx["amount"]
 
-        # Audit log transaction
         t = Transaction(
             group_id=group_id,
             from_user=from_user,
@@ -410,18 +687,17 @@ def settle_up(group_id: int, db: Session = Depends(get_db)):
         )
         db.add(t)
 
-        # Create a "settlement" expense that cancels this debt
         settlement_expense = Expense(
             group_id=group_id,
             paid_by=from_user,
             amount=amount,
             description="Settlement",
+            name="Settlement",
             receipt_url=None,
         )
         db.add(settlement_expense)
         db.flush()
 
-        # In this expense, to_user is the only one who "owes" the full amount
         split_to = Split(
             expense_id=settlement_expense.id,
             user_id=to_user,
@@ -559,6 +835,4 @@ def calc_settle(req: CalcRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # optional: seed here too if you ever run python main.py directly
-    # seed_demo()
     uvicorn.run(app, host="0.0.0.0", port=8000)
