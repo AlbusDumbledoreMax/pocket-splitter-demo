@@ -898,7 +898,7 @@ function SessionPage() {
     let m = settlementMatrix.map((row) => [...row]);
     const n = MATRIX_SIZE;
 
-    // net i->j vs j->i for all pairs (second pass, across all blocks)
+    // net i->j vs j->i for all pairs
     for (let i = 0; i < n; i++) {
       for (let j = i + 1; j < n; j++) {
         const a = m[i][j];
@@ -922,23 +922,68 @@ function SessionPage() {
     setSettlementMatrix(m);
 
     const lines = [];
+    const csvRows = [];
+
+    const sessionId = groupId; // session id from URL
+    const groupName = group?.name || ""; // group name
+
+    // CSV header
+    csvRows.push([
+      "session_id",
+      "group_name",
+      "from_person",
+      "to_person",
+      "amount",
+    ]);
+
     for (let i = 0; i < n; i++) {
       for (let j = 0; j < n; j++) {
         if (i === j) continue;
         const value = m[i][j];
         if (value && value !== 0) {
-          const row = i + 1;
-          const col = j + 1;
-          lines.push(`Person ${row} pays Person ${col} ₹${value}`);
+          const fromPerson = i + 1;
+          const toPerson = j + 1;
+          lines.push(`Person ${fromPerson} pays Person ${toPerson} ₹${value}`);
+
+          csvRows.push([sessionId, groupName, fromPerson, toPerson, value]);
         }
       }
     }
 
     if (lines.length === 0) {
       alert("Everyone is already settled up.");
-    } else {
-      alert(lines.join("\n"));
+      return;
     }
+
+    alert(lines.join("\n"));
+
+    // Build CSV string
+    const csvContent = csvRows
+      .map((row) =>
+        row
+          .map((cell) => {
+            const s = String(cell ?? "");
+            if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+              return `"${s.replace(/"/g, '""')}"`;
+            }
+            return s;
+          })
+          .join(","),
+      )
+      .join("\n");
+
+    // Trigger CSV download in browser
+    const blob = new Blob([csvContent], {
+      type: "text/csv;charset=utf-8;",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `settlement_session_${sessionId}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   // ---- render ----
