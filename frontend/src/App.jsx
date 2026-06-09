@@ -602,6 +602,14 @@ function SessionPage() {
 
   const [blocks, setBlocks] = useState([]);
 
+  // matrix for global Full & Final Settlement
+  const MATRIX_SIZE = 10;
+  const [settlementMatrix, setSettlementMatrix] = useState(
+    Array.from({ length: MATRIX_SIZE }, () =>
+      Array.from({ length: MATRIX_SIZE }, () => 0),
+    ),
+  );
+
   // load group once
   useEffect(() => {
     const fetchGroup = async () => {
@@ -684,13 +692,26 @@ function SessionPage() {
         const { data } = await axios.get(
           `${API}/groups/${groupId}/adhoc-blocks`,
         );
-        if (!cancelled) setBlocks(data);
+        if (cancelled) return;
+
+        setBlocks((prev) => {
+          const byId = new Map(prev.map((b) => [b.id, b]));
+          return (data || []).map((b) => {
+            const existing = byId.get(b.id);
+            return {
+              ...b,
+              expense_name: b.expense_name ?? existing?.expense_name ?? "",
+              bill_image_url:
+                b.bill_image_url ?? existing?.bill_image_url ?? "",
+            };
+          });
+        });
       } catch (e) {
         console.error("Error loading adhoc blocks", e);
       }
     };
     fetchBlocks();
-    const id = setInterval(fetchBlocks, 2000); // poll every 2s
+    const id = setInterval(fetchBlocks, 2000);
     return () => {
       cancelled = true;
       clearInterval(id);
@@ -706,8 +727,12 @@ function SessionPage() {
       const { data } = await axios.post(
         `${API}/groups/${groupId}/adhoc-blocks`,
       );
-      // optimistic update
-      setBlocks((prev) => [...prev, data]);
+      const full = {
+        ...data,
+        expense_name: data.expense_name || "",
+        bill_image_url: data.bill_image_url || "",
+      };
+      setBlocks((prev) => [...prev, full]);
     } catch (e) {
       console.error(e);
       alert("Error creating ad‑hoc block");
@@ -725,6 +750,8 @@ function SessionPage() {
       total_amount: Number(block.total_amount || 0),
       equal_split: !!block.equal_split,
       result: block.result || null,
+      expense_name: block.expense_name || "",
+      bill_image_url: block.bill_image_url || "",
     };
     try {
       await axios.put(
@@ -777,15 +804,31 @@ function SessionPage() {
     });
   };
 
+  const handleExpenseNameChange = (blockId, value) => {
+    updateBlockField(blockId, "expense_name", value);
+  };
+
+  const handleBillImageChange = (blockId, file) => {
+    const label = file ? file.name : "";
+    updateBlockField(blockId, "bill_image_url", label);
+  };
+
+  // Block-level settle + update global 10x10 matrix (running sum)
   const runCustomSettle = async (blockId) => {
     const block = blocks.find((b) => b.id === blockId);
     if (!block) return;
 
+    // Map this block's people to indices 1..n_people
+    const peopleWithIndex = block.people.map((p, idx) => ({
+      ...p,
+      index: idx + 1,
+    }));
+
     const payload = {
       total_amount: Number(block.total_amount || 0),
       equal_split: !!block.equal_split,
-      people: block.people.map((p) => ({
-        user_id: p.user_id,
+      people: peopleWithIndex.map((p) => ({
+        user_id: p.index, // 1..n per block for calculator
         name: p.name,
         paid: Number(p.paid || 0),
         share: Number(p.share || 0),
@@ -803,14 +846,98 @@ function SessionPage() {
         return;
       }
       const data = await res.json();
+
+      // keep block.result in sync
       updateBlockLocally(blockId, (b) => {
         const updated = { ...b, result: data };
         syncBlockToServer(updated);
         return updated;
       });
+
+      // update global 10x10 matrix with this block's netted suggestions (add, don't reset)
+      setSettlementMatrix((prev) => {
+        const next = prev.map((row) => [...row]);
+
+        (data.transactions || []).forEach((tx) => {
+          const row = parseInt(tx.from_user, 10);
+          const col = parseInt(tx.to_user, 10);
+          const value = Math.round(Number(tx.amount));
+
+          console.log("TX from block", blockId, { row, col, value });
+
+          if (
+            Number.isFinite(row) &&
+            Number.isFinite(col) &&
+            row >= 1 &&
+            row <= MATRIX_SIZE &&
+            col >= 1 &&
+            col <= MATRIX_SIZE &&
+            row !== col
+          ) {
+            next[row - 1][col - 1] += value; // accumulate
+          } else {
+            console.warn("Skipping TX outside matrix bounds", {
+              row,
+              col,
+              value,
+            });
+          }
+        });
+
+        console.log("Matrix after block", blockId, next);
+        return next;
+      });
     } catch (err) {
       console.error("Error calling /calc/settle", err);
       alert("Network error while running calculator");
+    }
+  };
+
+  const handleFullFinalSettlement = () => {
+    console.log("Matrix before full & final:", settlementMatrix);
+    let m = settlementMatrix.map((row) => [...row]);
+    const n = MATRIX_SIZE;
+
+    // net i->j vs j->i for all pairs (second pass, across all blocks)
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const a = m[i][j];
+        const b = m[j][i];
+        if (a === 0 && b === 0) continue;
+
+        if (a > b) {
+          m[i][j] = a - b;
+          m[j][i] = 0;
+        } else if (b > a) {
+          m[j][i] = b - a;
+          m[i][j] = 0;
+        } else {
+          m[i][j] = 0;
+          m[j][i] = 0;
+        }
+      }
+    }
+
+    console.log("Matrix after netting:", m);
+    setSettlementMatrix(m);
+
+    const lines = [];
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        if (i === j) continue;
+        const value = m[i][j];
+        if (value && value !== 0) {
+          const row = i + 1;
+          const col = j + 1;
+          lines.push(`Person ${row} pays Person ${col} ₹${value}`);
+        }
+      }
+    }
+
+    if (lines.length === 0) {
+      alert("Everyone is already settled up.");
+    } else {
+      alert(lines.join("\n"));
     }
   };
 
@@ -941,6 +1068,10 @@ function SessionPage() {
         >
           + Add more expense
         </button>
+
+        <button type="button" onClick={handleFullFinalSettlement}>
+          Full &amp; Final Settlement
+        </button>
       </div>
 
       {blocks.map((block) => (
@@ -953,124 +1084,201 @@ function SessionPage() {
             background: "#fafafa",
           }}
         >
-          <h3>Ad‑hoc Group Settle (n people)</h3>
-
-          <div style={{ marginBottom: 8 }}>
-            <label>
-              Number of people (n):{" "}
-              <input
-                type="number"
-                min={1}
-                value={block.n_people}
-                onChange={(e) =>
-                  handleNPeopleChange(block.id, Number(e.target.value) || 1)
-                }
-              />
-            </label>
-          </div>
-
-          <div style={{ marginBottom: 8 }}>
-            <label>
-              Total amount:{" "}
-              <input
-                type="number"
-                value={block.total_amount}
-                onChange={(e) =>
-                  updateBlockField(block.id, "total_amount", e.target.value)
-                }
-              />
-            </label>
-          </div>
-
-          <div style={{ marginBottom: 8 }}>
-            <label>
-              <input
-                type="checkbox"
-                checked={block.equal_split}
-                onChange={(e) =>
-                  updateBlockField(block.id, "equal_split", e.target.checked)
-                }
-              />{" "}
-              Equal split (ignore % shares)
-            </label>
-          </div>
-
-          <table
-            border="1"
-            cellPadding="4"
-            style={{ marginBottom: 8, width: "100%" }}
+          <div
+            style={{
+              display: "flex",
+              gap: 16,
+              alignItems: "flex-start",
+              flexWrap: "wrap",
+            }}
           >
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Who (name)</th>
-                <th>Paid amount</th>
-                <th>Share % / weight</th>
-              </tr>
-            </thead>
-            <tbody>
-              {block.people.map((p, idx) => (
-                <tr key={p.user_id}>
-                  <td>{idx + 1}</td>
-                  <td>
-                    <input
-                      value={p.name}
-                      onChange={(e) =>
-                        updatePersonField(block.id, idx, "name", e.target.value)
-                      }
-                    />
-                  </td>
-                  <td>
-                    <input
-                      type="number"
-                      value={p.paid}
-                      onChange={(e) =>
-                        updatePersonField(block.id, idx, "paid", e.target.value)
-                      }
-                    />
-                  </td>
-                  <td>
-                    <input
-                      type="number"
-                      value={p.share}
-                      onChange={(e) =>
-                        updatePersonField(
-                          block.id,
-                          idx,
-                          "share",
-                          e.target.value,
-                        )
-                      }
-                    />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+            {/* Left: ad-hoc calculator */}
+            <div style={{ flex: 2, minWidth: 260 }}>
+              <h3>Ad‑hoc Group Settle (n people)</h3>
 
-          <button onClick={() => runCustomSettle(block.id)}>
-            Show Settlement Suggestions
-          </button>
+              <div style={{ marginBottom: 8 }}>
+                <label>
+                  Number of people (n):{" "}
+                  <input
+                    type="number"
+                    min={1}
+                    value={block.n_people}
+                    onChange={(e) =>
+                      handleNPeopleChange(block.id, Number(e.target.value) || 1)
+                    }
+                  />
+                </label>
+              </div>
 
-          {block.result && (
-            <div style={{ marginTop: 12 }}>
-              <h4>Suggested settlements</h4>
-              <ul>
-                {block.result.transactions.map((tx, i) => {
-                  const from = block.people.find(
-                    (p) => p.user_id === tx.from_user,
-                  );
-                  const to = block.people.find((p) => p.user_id === tx.to_user);
-                  return (
-                    <li key={i}>
-                      {from?.name || tx.from_user} pays {to?.name || tx.to_user}{" "}
-                      ₹{tx.amount.toFixed(2)}
-                    </li>
-                  );
-                })}
-              </ul>
+              <div style={{ marginBottom: 8 }}>
+                <label>
+                  Total amount:{" "}
+                  <input
+                    type="number"
+                    value={block.total_amount}
+                    onChange={(e) =>
+                      updateBlockField(block.id, "total_amount", e.target.value)
+                    }
+                  />
+                </label>
+              </div>
+
+              <div style={{ marginBottom: 8 }}>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={block.equal_split}
+                    onChange={(e) =>
+                      updateBlockField(
+                        block.id,
+                        "equal_split",
+                        e.target.checked,
+                      )
+                    }
+                  />{" "}
+                  Equal split (ignore % shares)
+                </label>
+              </div>
+
+              <table
+                border="1"
+                cellPadding="4"
+                style={{ marginBottom: 8, width: "100%" }}
+              >
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Who (name)</th>
+                    <th>Paid amount</th>
+                    <th>Share % / weight</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {block.people.map((p, idx) => (
+                    <tr key={p.user_id}>
+                      <td>{idx + 1}</td>
+                      <td>
+                        <input
+                          value={p.name}
+                          onChange={(e) =>
+                            updatePersonField(
+                              block.id,
+                              idx,
+                              "name",
+                              e.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          value={p.paid}
+                          onChange={(e) =>
+                            updatePersonField(
+                              block.id,
+                              idx,
+                              "paid",
+                              e.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          value={p.share}
+                          onChange={(e) =>
+                            updatePersonField(
+                              block.id,
+                              idx,
+                              "share",
+                              e.target.value,
+                            )
+                          }
+                        />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              <button onClick={() => runCustomSettle(block.id)}>
+                Show Settlement Suggestions
+              </button>
+
+              {block.result && block.result.transactions && (
+                <div style={{ marginTop: 12 }}>
+                  <h4>Suggested settlements</h4>
+                  <ul>
+                    {block.result.transactions.map((tx, i) => {
+                      const from = block.people.find(
+                        (p) => p.user_id === tx.from_user,
+                      );
+                      const to = block.people.find(
+                        (p) => p.user_id === tx.to_user,
+                      );
+                      return (
+                        <li key={i}>
+                          {from?.name || tx.from_user} pays{" "}
+                          {to?.name || tx.to_user} ₹{tx.amount.toFixed(2)}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              )}
             </div>
-          )}
+
+            {/* Right: expense name + bill image */}
+            <div style={{ flex: 1, minWidth: 220 }}>
+              <h4>Expense details</h4>
+
+              <div style={{ marginBottom: 8 }}>
+                <label>
+                  Expense name:
+                  <input
+                    type="text"
+                    value={block.expense_name || ""}
+                    onChange={(e) =>
+                      handleExpenseNameChange(block.id, e.target.value)
+                    }
+                    style={{
+                      width: "100%",
+                      padding: "0.4rem",
+                      marginTop: 4,
+                      borderRadius: 4,
+                      border: "1px solid #ccc",
+                    }}
+                    placeholder="e.g. Dinner, Uber, Groceries"
+                  />
+                </label>
+              </div>
+
+              <div style={{ marginBottom: 8 }}>
+                <label>
+                  Upload bill image:
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) =>
+                      handleBillImageChange(
+                        block.id,
+                        e.target.files?.[0] || null,
+                      )
+                    }
+                    style={{ display: "block", marginTop: 4 }}
+                  />
+                </label>
+              </div>
+
+              {block.bill_image_url && (
+                <div style={{ fontSize: "0.8rem", color: "#555" }}>
+                  Selected file: <code>{block.bill_image_url}</code>
+                </div>
+              )}
+            </div>
+          </div>
         </section>
       ))}
     </div>
