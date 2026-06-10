@@ -34,6 +34,7 @@ rignore==0.7.6
 sentry-sdk==2.61.1
 shellingham==1.5.4
 starlette==1.2.1
+sqlalchemy==2.0.19
 typer==0.26.7
 typing-inspection==0.4.2
 typing_extensions==4.15.0
